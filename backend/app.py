@@ -21,7 +21,7 @@ GAME_CONFIG = {
     'INITIAL_LENGTH': 10,
     
     # --- TUNING ---
-    'DEBUG_MODE': True,            
+    'DEBUG_MODE': False,            
     'BOT_TURN_MULTIPLIER': 1.2,     
     'BOT_CENTER_BIAS': 0.001,       
     'BOT_WANDER_CHANCE': 0.05,      
@@ -32,10 +32,7 @@ GAME_CONFIG = {
     'INITIAL_TURN_SPEED': 0.5,
     'MIN_TURN_SPEED': 0.08,
     
-    # CHANGED: 0.8 is the sweet spot when visuals match physics
-    'HITBOX_RATIO': 0.8,        
-    
-    'FOOD_PICKUP_RATIO': 0.9,   
+    'FOOD_PICKUP_RATIO': 0.8,   
     'FOOD_PICKUP_EXTRA': 10,
     'FOOD_DROP_RATIO': 0.5,
     'LOOT_EXPIRY_MS': 15000,
@@ -49,7 +46,6 @@ food = {}
 spatial_grid = {} 
 respawn_queue = [] 
 
-# CACHE
 FOOD_LIST_CACHE = []
 FOOD_CACHE_DIRTY = True
 
@@ -79,10 +75,24 @@ def generate_name():
     NOUNS = ["Python", "Viper", "Noodle", "Cobra", "Worm", "Boa", "Mamba", "Slider", "Glider", "Serpent", "Bot", "Droid", "Dragon", "Basilisk"]
     return f"{random.choice(ADJECTIVES)} {random.choice(NOUNS)}"
 
-# CHANGED: The "Truth" Formula
-# Starts at 10px. Grows to 35px.
+# --- NEW PHYSICS: DYNAMIC HITBOX ---
 def get_radius(length):
-    return 10 + min(25, int(length / 20))
+    """Visual Radius"""
+    return 6 + min(28, int(length / 15))
+
+def get_hitbox_radius(length):
+    """
+    Collision Radius.
+    Small snakes need BIG hitboxes (0.9 ratio) to feel solid.
+    Big snakes need TINY hitboxes (0.4 ratio) to allow maneuvering.
+    """
+    vis_rad = get_radius(length)
+    if length < 50:
+        return vis_rad * 0.9 
+    elif length < 200:
+        return vis_rad * 0.7 
+    else:
+        return vis_rad * 0.4 
 
 def get_turn_speed(length):
     decay = GAME_CONFIG['TURN_DECAY_FACTOR']
@@ -98,8 +108,7 @@ def smart_serialize_players():
             'y': round(p.get('y', 0), 1),
             'angle': round(p['angle'], 2),
             'length': int(p['length']),
-            # SEND RADIUS SO FRONTEND DOESN'T GUESS
-            'radius': get_radius(p['length']),
+            'radius': get_radius(p['length']), 
             'color': p['color'],
             'skin': p.get('skin', 'solid'),
             'name': p['name'],
@@ -149,9 +158,12 @@ def get_nearby_players(pid):
     return list(candidates)
 
 # --- GAME LOGIC ---
-def spawn_food(x=None, y=None, value=1, scatter=25): 
+def spawn_food(x=None, y=None, value=1, scatter=25, force=False): 
     global FOOD_CACHE_DIRTY
-    if len(food) >= GAME_CONFIG['MAX_FOOD']: return None
+    
+    # <--- MODIFIED: Allow forcing spawn even if full
+    if not force and len(food) >= GAME_CONFIG['MAX_FOOD']: 
+        return None
 
     fid = f"f_{random.randint(0, 999999999)}"
     if x is not None:
@@ -250,8 +262,8 @@ def update_bot_ai(pid):
                 if (tx - t['body'][0]['x'])**2 + (ty - t['body'][0]['y'])**2 < 22500: blocked = True; break
                 if (head['x'] - t['body'][0]['x'])**2 + (head['y'] - t['body'][0]['y'])**2 > (look_radius + 200)**2: continue
 
-                t_rad = get_radius(t['length'])
-                safe_dist_sq = (t_rad + 40)**2
+                t_rad = get_hitbox_radius(t['length']) 
+                safe_dist_sq = (t_rad + 30)**2
                 for j in range(0, len(t['body'])-1, 3):
                     if get_dist_sq_point_to_segment(t['body'][j]['x'], t['body'][j]['y'], head['x'], head['y'], tx, ty) < safe_dist_sq: 
                         blocked=True; break
@@ -393,11 +405,12 @@ async def game_loop():
                 FOOD_CACHE_DIRTY = True
         time_stats['physics'] += (time.perf_counter() - t_phys)
 
-        # Collisions
+        # Collisions (Dynamic Hitbox)
         t_col = time.perf_counter()
         for pid in player_ids:
             if pid not in players: continue
-            p = players[pid]; head = p['body'][0]; r1 = get_radius(p['length']) * GAME_CONFIG['HITBOX_RATIO']
+            p = players[pid]; head = p['body'][0]; 
+            r1 = get_hitbox_radius(p['length']) 
             
             if head['x'] < r1 or head['x'] > GAME_CONFIG['MAP_SIZE']-r1 or head['y'] < r1 or head['y'] > GAME_CONFIG['MAP_SIZE']-r1:
                 dead_players.add(pid); continue
@@ -407,7 +420,7 @@ async def game_loop():
                 o = players[opid]; 
                 if not o.get('body'): continue
                 
-                r2 = get_radius(o['length']) * GAME_CONFIG['HITBOX_RATIO']
+                r2 = get_hitbox_radius(o['length']) 
                 hit_threshold_sq = (r1 + r2)**2
 
                 if (head['x'] - o['body'][0]['x'])**2 + (head['y'] - o['body'][0]['y'])**2 < hit_threshold_sq:
@@ -429,10 +442,37 @@ async def game_loop():
             if pid in players:
                 p = players[pid]
                 if p.get('body'):
+                    # <--- NEW DEATH LOGIC START
+                    drops_to_spawn = []
+                    
+                    # 1. Calculate how many drops we WANT to create
                     for s in p['body']:
-                        if random.random() < GAME_CONFIG['FOOD_DROP_RATIO']: 
-                            res = spawn_food(s['x'], s['y'], 5, 12)
-                            if res: added_food[res[0]] = serialize_single_food(res[1])
+                        if random.random() < GAME_CONFIG['FOOD_DROP_RATIO']:
+                             drops_to_spawn.append(s)
+                    
+                    # 2. Check how many slots we need vs how many we have
+                    slots_needed = len(food) + len(drops_to_spawn) - GAME_CONFIG['MAX_FOOD']
+                    
+                    # 3. If over capacity, delete small ambient food (value=1) to make room
+                    if slots_needed > 0:
+                        keys_to_remove = []
+                        for fid, f in food.items():
+                            if f['value'] == 1 and not f['is_loot']:
+                                keys_to_remove.append(fid)
+                                if len(keys_to_remove) >= slots_needed:
+                                    break
+                        
+                        # Delete the victims and tell clients
+                        for fid in keys_to_remove:
+                            del food[fid]
+                            removed_food_ids.append(fid)
+                            FOOD_CACHE_DIRTY = True
+
+                    # 4. Spawn the loot (Force = True ensures we spawn even if slightly over limit)
+                    for s in drops_to_spawn:
+                        res = spawn_food(s['x'], s['y'], 5, 12, force=True)
+                        if res: added_food[res[0]] = serialize_single_food(res[1])
+                    # <--- NEW DEATH LOGIC END
                 
                 if p.get('is_bot'): respawn_player(pid, is_bot=True)
                 else:
